@@ -16,13 +16,15 @@
 
 require 'rubygems'
 require 'echoe'
+
 VERSION = File.open('../../share/VERSION.txt').read.sub('-SNAPSHOT', '.pre1').chomp
+
 Echoe.new('avro', VERSION) do |p|
   p.author = "Apache Software Foundation"
-  p.email = "avro-dev@hadoop.apache.org"
+  p.email = "dev@avro.apache.org"
   p.summary = "Apache Avro for Ruby"
   p.description = "Avro is a data serialization and RPC format"
-  p.url = "http://hadoop.apache.org/avro/"
+  p.url = "http://avro.apache.org/"
   p.runtime_dependencies = %w[multi_json]
 end
 
@@ -61,3 +63,4 @@ task :dist => [:gem] do
   mkdir_p "../../dist/ruby"
   cp "pkg/avro-#{VERSION}.gem", "../../dist/ruby"
 end
+

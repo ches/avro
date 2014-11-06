@@ -41,8 +41,12 @@ case "$1" in
         bundle exec rake clean
        ;;
 
+     doc)
+        bundle exec yard doc
+       ;;
+
      *)
-       echo "Usage: $0 {test|dist|clean}"
+       echo "Usage: $0 {test|dist|clean|doc}"
        exit 1
 
 esac

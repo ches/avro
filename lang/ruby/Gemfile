@@ -14,6 +14,15 @@
 # limitations under the License.
 
 source 'https://rubygems.org' 
-gem 'rake'
-gem 'echoe'
+
 gem 'multi_json'
+
+group :development do
+  gem 'echoe'
+  gem 'rake'
+  gem 'yard', '~> 0.8.7'
+
+  # For consistent Markdown rendering between GitHub README and rubydoc.info
+  gem 'redcarpet', '~> 2.3'
+end
+
