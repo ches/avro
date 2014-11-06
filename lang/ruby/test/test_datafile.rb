@@ -159,6 +159,7 @@ JSON
       writer << 'a' * 10_000
     end
     assert(File.size('data.avr') < 500)
+    # TODO: read the metadata and assert codec
 
     records = []
     Avro::DataFile.open('data.avr') do |reader|
@@ -186,3 +187,4 @@ JSON
     assert_equal records, ['a' * 10_000, 'b' * 10_000]
   end
 end
+

@@ -17,22 +17,83 @@
 require 'openssl'
 
 module Avro
+  # Support for writing and reading encoded and compressed Avro data to and
+  # from Object Container Files.
+  #
+  # @see http://avro.apache.org/docs/current/spec.html#Object+Container+Files Object Container File specification
   module DataFile
+    # Format version of the Avro Object Container File specification.
     VERSION = 1
+
+    # Magic bytes indicating format version, written to file headers.
     MAGIC = "Obj" + [VERSION].pack('c')
     MAGIC.force_encoding('BINARY') if MAGIC.respond_to?(:force_encoding)
+
+    # Size in bytes of the format version magic indicator.
     MAGIC_SIZE = MAGIC.respond_to?(:bytesize) ? MAGIC.bytesize : MAGIC.size
-    SYNC_SIZE = 16
-    SYNC_INTERVAL = 4000 * SYNC_SIZE
+
+    # Schema of metadata component in file headers, according to specification,
+    # which must include the schema of objects stored in the file, and may
+    # contain arbitrary user-specified metadata.
     META_SCHEMA = Schema.parse('{"type": "map", "values": "bytes"}')
-    VALID_ENCODINGS = ['binary'] # not used yet
+
+    # Size in bytes of sync markers demarcating each data block in a file.
+    SYNC_SIZE = 16
+
+    # Interval in bytes after which a synchronization marker is written if the
+    # size of a data block exceeds it.
+    #
+    # @see https://cwiki.apache.org/confluence/display/AVRO/FAQ#FAQ-Whatisthepurposeofthesyncmarkerintheobjectfileformat? What is the purpose of the sync marker in the object file format?
+    SYNC_INTERVAL = 4000 * SYNC_SIZE
+
+    # Not yet used.
+    VALID_ENCODINGS = ['binary']
 
     class DataFileError < AvroError; end
 
+    # Open an encoded Avro data file for reading or writing.
+    #
+    # If a block is given, the yielded {Writer} or {Reader} will have its
+    # underlying file handle closed automatically when the block terminates.
+    #
+    # @param file_path [String, Pathname]
+    #   Path of file to open.
+    # @param mode ['r', 'w']
+    #   Whether to open file for reading (+r+) or writing (+w+).
+    # @param schema [String]
+    #   The schema to use for reading or writing serialized objects. When in
+    #   read mode, the given schema will be considered the "reader's schema"
+    #   for schema resoluton purposes.
+    # @param codec
+    #   The codec to use when writing. If write mode is specified and no codec
+    #   is given, appending to an existing file is assumed and the file must
+    #   already contain metadata declaring a codec.
+    #
+    # @yield [Reader, Writer]
+    #   A {Reader} or {Writer} to a given block, depending on mode specified.
+    #
+    # @return [Reader, Writer]
+    #   A {Reader} or {Writer}, depending on the mode specified.
+    #
+    # @raise [DataFileError]
+    #   if any value other than 'r' or 'w' is given for +mode+ param, or write
+    #   mode is specified but no schema is given.
+    #
+    # @see http://avro.apache.org/docs/current/spec.html#Schema+Resolution Schema Resolution
+    #
+    # @todo Accept an Avro::Schema instance for schema param
     def self.open(file_path, mode='r', schema=nil, codec=nil)
       schema = Avro::Schema.parse(schema) if schema
       case mode
       when 'w'
+        # TODO: Writer allows giving no schema and tries to append using existing
+        # schema; we should probably be consistent and keep or drop that behavior,
+        # codec is handled similarly, and otherwise it seems this method provides
+        # no means of appending; update docs here for the decisions
+        #
+        # TODO: Inconsistent semantics for write mode with schema param being
+        # required but codec allowed to be nil--it looks like this will break,
+        # write a test
         unless schema
           raise DataFileError, "Writing an Avro file requires a schema."
         end
@@ -49,16 +110,38 @@ module Avro
       io.close if block_given? && io
     end
 
+    # Registered compression codecs for Avro data.
+    #
+    # @return [Hash]
+    #   Mapping of codecs, where keys are String codec names and values are
+    #   classes implementing the codec interface.
     def self.codecs
       @codecs
     end
 
+    # Register a compression codec for Avro data.
+    #
+    # @param codec
+    #   A class or instance implementing the codec interface.
+    #
+    # @return The codec instance that was registered.
+    #
+    # @todo
+    #   There ought to be a formal abstract class or mixin for the codec interface.
     def self.register_codec(codec)
       @codecs ||= {}
       codec = codec.new if !codec.respond_to?(:codec_name) && codec.is_a?(Class)
       @codecs[codec.codec_name.to_s] = codec
     end
 
+    # Convenience method to look up a codec instance, given any of several types
+    # of codec identifier.
+    #
+    # @param codec
+    #   A codec class, instance of a codec class, or the String name of a
+    #   registered codec.
+    #
+    # @return A codec instance
     def self.get_codec(codec)
       codec ||= 'null'
       if codec.respond_to?(:compress) && codec.respond_to?(:decompress)
@@ -75,26 +158,57 @@ module Avro
     class << self
       private
       def open_writer(file, schema, codec=nil)
-        writer = Avro::IO::DatumWriter.new(schema)
-        Avro::DataFile::Writer.new(file, writer, schema, codec)
+        writer = IO::DatumWriter.new(schema)
+        Writer.new(file, writer, schema, codec)
       end
 
       def open_reader(file, schema)
-        reader = Avro::IO::DatumReader.new(nil, schema)
-        Avro::DataFile::Reader.new(file, reader)
+        reader = IO::DatumReader.new(nil, schema)
+        Reader.new(file, reader)
       end
     end
 
+    # A Writer instance manages the details of writing a valid Avro Container
+    # Object File while presenting a simple abstraction to users, akin to
+    # adding Ruby data structures conforming to the schema (objects) to an
+    # Array (the container file).
+    #
+    # It is typically most convenient to use a Writer yielded by {DataFile.open}
+    # rather than instantiating directly.
+    #
+    # @todo At present, giving no writer's schema upon instantation implicitly
+    #   invokes append behavior. This is not completely intuitive and there
+    #   should probably be an explicit append mode.
     class Writer
       def self.generate_sync_marker
         OpenSSL::Random.random_bytes(16)
       end
 
+      # TODO: most of these can/should be private
       attr_reader :writer, :encoder, :datum_writer, :buffer_writer, :buffer_encoder, :sync_marker, :meta, :codec
       attr_accessor :block_count
 
+      # Instantiate a new Writer for a given Avro file.
+      #
+      # @param writer [File]
+      #   The file to write.
+      # @param datum_writer [DatumWriter]
+      #   A DatumWriter instance. Its schema will be set automatically depending
+      #   on whether the Writer will create a new file or append.
+      # @param writers_schema [Schema, String]
+      #   Schema to write in the header of a new file, as a {Schema} instance
+      #   or in String form. If not given, it is assumed the Writer will
+      #   append to an existing file.
+      # @param codec
+      #   A lookup identifier for which {get_codec} can return a codec instance.
+      #
+      # @return [Writer]
+      #
+      # @todo To avoid the implicit append assumption, callers must redundantly
+      #   give the writer's schema as a direct param even though they might
+      #   instead have set it on the DatumWriter instance. This is weird.
+      #   There's really no reason for a caller to need to pass a DatumWriter.
       def initialize(writer, datum_writer, writers_schema=nil, codec=nil)
-        # If writers_schema is not present, presume we're appending
         @writer = writer
         @encoder = IO::BinaryEncoder.new(@writer)
         @datum_writer = datum_writer
@@ -105,6 +219,12 @@ module Avro
 
         @meta = {}
 
+        # If writers_schema is not present, presume we're appending
+        #
+        # TODO: This has flaws. It should be possible to explicitly append even
+        # when a schema is given, then schema resolution or bailing should be
+        # considered if new objects are being written but schema is different
+        # from the file's metadata.
         if writers_schema
           @sync_marker = Writer.generate_sync_marker
           @codec = DataFile.get_codec(codec)
@@ -114,6 +234,9 @@ module Avro
           write_header
         else
           # open writer for reading to collect metadata
+          #
+          # TODO: Need to throw an exception if the file does not exist and is
+          # not an Avro file with existing schema.
           dfr = Reader.new(writer, Avro::IO::DatumReader.new)
 
           # FIXME(jmhodges): collect arbitrary metadata
@@ -132,7 +255,13 @@ module Avro
         end
       end
 
-      # Append a datum to the file
+      # Append a datum to the file.
+      #
+      # If the block size threshold has been reached, a synchronization marker
+      # will be written.
+      #
+      # @param datum [Object]
+      #   A Ruby object conforming to the {Schema} of this Writer instance.
       def <<(datum)
         datum_writer.write(datum, buffer_encoder)
         self.block_count += 1
@@ -145,8 +274,8 @@ module Avro
       end
 
       # Return the current position as a value that may be passed to
-      # DataFileReader.seek(long). Forces the end of the current block,
-      # emitting a synchronization marker.
+      # Reader#reader.seek. Forces the end of the current block, emitting a
+      # synchronization marker.
       def sync
         write_block
         writer.tell
@@ -158,6 +287,7 @@ module Avro
         writer.flush
       end
 
+      # Close the file, flushing any pending buffered block.
       def close
         flush
         writer.close
@@ -199,7 +329,12 @@ module Avro
       end
     end
 
-    # Read files written by DataFileWriter
+    # A Reader instance manages the details of reading the Object Container File
+    # format, in order to present the objects contained in a file to users as an
+    # {Enumerable} collection.
+    #
+    # It is typically most convenient to use a Reader yielded by {DataFile.open}
+    # rather than instantiating directly.
     class Reader
       include ::Enumerable
 
@@ -212,6 +347,15 @@ module Avro
       attr_reader :datum_reader, :sync_marker, :meta, :file_length, :codec
       attr_accessor :block_count # records remaining in current block
 
+      # Instantiate a new Reader for a given Avro file.
+      #
+      # @param reader [File]
+      #   The file from which to read.
+      # @param datum_reader [DatumReader]
+      #   A DatumReader initialized with a reader's schema for the file's
+      #   objects. The writer's schema will be set from the file metadata.
+      #
+      # @return [Reader]
       def initialize(reader, datum_reader)
         @reader = reader
         @decoder = IO::BinaryDecoder.new(reader)
@@ -228,12 +372,18 @@ module Avro
       end
 
       # Iterates through each datum in this file
-      # TODO(jmhodges): handle block of length zero
+      #
+      # @yield [Object]
+      #   The deserialized object for each datum.
+      # @return [void]
+      #
+      # @todo Handle block of length zero
+      # @todo Return Enumerator when no block given
       def each
         loop do
           if block_count == 0
             case
-            when eof?; break
+            when eof? then break
             when skip_sync
               break if eof?
               read_block_header
@@ -248,8 +398,14 @@ module Avro
         end
       end
 
+      # Whether the Reader has reached the end of the container file.
+      #
+      # @return [Boolean]
       def eof?; reader.eof?; end
 
+      # Close the handle to the Reader's underlying file.
+      #
+      # @return [void]
       def close
         reader.close
       end
@@ -299,12 +455,15 @@ module Avro
     end
 
 
+    # Null codec implementation, passing data through with no compression.
     class NullCodec
       def codec_name; 'null'; end
       def decompress(data); data; end
       def compress(data); data; end
     end
 
+    # Deflate codec implementation, supporting serialized object data with RFC
+    # 1951 zlib compression.
     class DeflateCodec
       attr_reader :level
 
@@ -337,8 +496,11 @@ module Avro
     DataFile.register_codec NullCodec
     DataFile.register_codec DeflateCodec
 
-    # TODO this constant won't be updated if you register another codec.
-    # Deprecated in favor of Avro::DataFile::codecs
+    # The default registered compression codecs.
+    #
+    # @deprecated Use {DataFile.codecs}--this constant won't be updated if you
+    #   register additional codecs.
     VALID_CODECS = DataFile.codecs.keys
   end
 end
+
